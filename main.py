@@ -23,7 +23,7 @@ load_dotenv()
 API_ID       = int(os.getenv("API_ID", "0"))
 API_HASH     = os.getenv("API_HASH", "")
 CHANNEL_NAME = os.getenv("CHANNEL_NAME", "")   # e.g. "@mychannel" or "-1001234567890"
-SESSION_NAME = "telegram_session"
+SESSION_NAME = os.getenv("SESSION_NAME", "")
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Telegram Video Streamer")
