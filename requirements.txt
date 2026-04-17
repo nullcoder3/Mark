@@ -1,0 +1,5 @@
+fastapi==0.95.2
+uvicorn==0.30.6
+telethon==1.36.0
+python-dotenv==1.0.1
+pydantic==1.10.13
