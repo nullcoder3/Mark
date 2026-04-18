@@ -1,10 +1,5 @@
 """
-Telegram Video Streaming Backend
----------------------------------
-FastAPI + Telethon backend that:
-1. Connects to your Telegram account
-2. Lists all videos from your channel
-3. Streams videos to the browser on demand
+Telegram Video Streaming Backend (Render-compatible fix)
 """
 
 import os
@@ -15,45 +10,73 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument, DocumentAttributeVideo, DocumentAttributeFilename
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-API_ID       = int(os.getenv("API_ID", "0"))
-API_HASH     = os.getenv("API_HASH", "")
-CHANNEL_NAME = os.getenv("CHANNEL_NAME", "")   # e.g. "@mychannel" or "-1001234567890"
-SESSION_NAME = "telegram_session"
+API_ID       = int(os.environ.get("API_ID", "0"))
+API_HASH     = os.environ.get("API_HASH", "")
+CHANNEL_NAME = os.environ.get("CHANNEL_NAME", "")
+
+# Session file lives in /opt/render/project/src/ on Render
+BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
+SESSION_PATH = os.path.join(BASE_DIR, "telegram_session")
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Telegram Video Streamer")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # In production, replace with your website URL
-    allow_methods=["GET"],
+    allow_origins=["*"],
+    allow_methods=["GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# Global Telegram client (created once at startup)
 client: TelegramClient = None
 
 
 @app.on_event("startup")
 async def startup():
     global client
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-    await client.start()
-    print("✅ Connected to Telegram!")
+
+    # Validate env vars
+    if not API_ID or API_ID == 0:
+        raise RuntimeError("API_ID environment variable is missing or zero!")
+    if not API_HASH:
+        raise RuntimeError("API_HASH environment variable is missing!")
+    if not CHANNEL_NAME:
+        raise RuntimeError("CHANNEL_NAME environment variable is missing!")
+
+    # Check session file exists
+    session_file = SESSION_PATH + ".session"
+    if not os.path.exists(session_file):
+        raise RuntimeError(
+            f"Session file not found at {session_file}. "
+            "Did you upload telegram_session.session to your GitHub repo?"
+        )
+
+    print(f"✅ Session file found: {session_file}")
+    print(f"✅ Connecting with API_ID={API_ID}, CHANNEL={CHANNEL_NAME}")
+
+    client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        raise RuntimeError(
+            "Telegram session is not authorized. "
+            "Please re-create the session file using Replit."
+        )
+
+    me = await client.get_me()
+    print(f"✅ Connected to Telegram as: {me.first_name} (@{me.username})")
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    await client.disconnect()
+    global client
+    if client:
+        await client.disconnect()
 
 
 def get_video_info(message) -> dict | None:
-    """Extract video metadata from a Telegram message."""
     if not message.media or not isinstance(message.media, MessageMediaDocument):
         return None
 
@@ -62,14 +85,12 @@ def get_video_info(message) -> dict | None:
     if not is_video:
         return None
 
-    # Get filename
     filename = f"video_{message.id}.mp4"
     for attr in doc.attributes:
         if isinstance(attr, DocumentAttributeFilename):
             filename = attr.file_name
             break
 
-    # Get duration
     duration = 0
     for attr in doc.attributes:
         if isinstance(attr, DocumentAttributeVideo):
@@ -87,16 +108,13 @@ def get_video_info(message) -> dict | None:
     }
 
 
-# ── ROUTES ────────────────────────────────────────────────────────────────────
-
 @app.get("/")
 async def root():
-    return {"status": "running", "message": "Telegram Video Streamer API"}
+    return {"status": "running", "message": "Telegram Video Streamer API ✅"}
 
 
 @app.get("/videos")
 async def list_videos(limit: int = 50):
-    """Return a list of all videos in the channel."""
     videos = []
     try:
         async for message in client.iter_messages(CHANNEL_NAME, limit=limit):
@@ -105,13 +123,11 @@ async def list_videos(limit: int = 50):
                 videos.append(info)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
     return JSONResponse({"videos": videos, "count": len(videos)})
 
 
 @app.get("/stream/{message_id}")
 async def stream_video(message_id: int, request: Request):
-    """Stream a video by its Telegram message ID (supports range requests for seeking)."""
     try:
         message = await client.get_messages(CHANNEL_NAME, ids=message_id)
     except Exception as e:
@@ -124,34 +140,31 @@ async def stream_video(message_id: int, request: Request):
     if not info:
         raise HTTPException(status_code=400, detail="Not a video message")
 
-    file_size  = info["size"]
-    mime_type  = info["mime_type"]
+    file_size = info["size"]
+    mime_type = info["mime_type"]
 
-    # ── Handle Range requests (needed for video seeking) ──────────────────────
     range_header = request.headers.get("range")
     start, end = 0, file_size - 1
 
     if range_header:
         try:
             range_val = range_header.strip().replace("bytes=", "")
-            parts     = range_val.split("-")
-            start     = int(parts[0]) if parts[0] else 0
-            end       = int(parts[1]) if parts[1] else file_size - 1
+            parts = range_val.split("-")
+            start = int(parts[0]) if parts[0] else 0
+            end   = int(parts[1]) if parts[1] else file_size - 1
         except Exception:
             pass
 
-    chunk_size    = end - start + 1
-    offset        = start
-    # Telethon streams in 1MB chunks; align to nearest 1MB boundary
-    request_size  = min(1 * 1024 * 1024, chunk_size)
+    chunk_size   = end - start + 1
+    request_size = min(1 * 1024 * 1024, chunk_size)
 
     async def video_generator() -> AsyncGenerator[bytes, None]:
         downloaded = 0
         async for chunk in client.iter_download(
             message.media,
-            offset      = offset,
-            request_size= request_size,
-            limit       = chunk_size,
+            offset=start,
+            request_size=request_size,
+            limit=chunk_size,
         ):
             downloaded += len(chunk)
             yield chunk
@@ -168,15 +181,14 @@ async def stream_video(message_id: int, request: Request):
 
     return StreamingResponse(
         video_generator(),
-        status_code = status_code,
-        headers     = headers,
-        media_type  = mime_type,
+        status_code=status_code,
+        headers=headers,
+        media_type=mime_type,
     )
 
 
 @app.get("/thumbnail/{message_id}")
 async def get_thumbnail(message_id: int):
-    """Return a video thumbnail (if available)."""
     try:
         message = await client.get_messages(CHANNEL_NAME, ids=message_id)
     except Exception:
@@ -188,10 +200,7 @@ async def get_thumbnail(message_id: int):
     try:
         thumb_bytes = await client.download_media(message.media, bytes, thumb=-1)
         if thumb_bytes:
-            return StreamingResponse(
-                iter([thumb_bytes]),
-                media_type="image/jpeg",
-            )
+            return StreamingResponse(iter([thumb_bytes]), media_type="image/jpeg")
     except Exception:
         pass
 
